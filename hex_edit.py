@@ -14,6 +14,9 @@ Requires:
 import tkinter as tk
 from tkinter import ttk, filedialog, colorchooser, messagebox
 from tkinter import font as tkfont
+import code
+import contextlib
+import io
 import json
 import os
 import struct
@@ -30,6 +33,8 @@ except ImportError:
 # ── Constants ────────────────────────────────────────────────────────────────
 
 OFFSET_COLS = 10   # "XXXXXXXX  " — 8 hex digits + 2 spaces
+
+HEX_CELL_COLS = 4  # " XX " centered display cell for one byte
 
 PALETTE = [
     "#ff6b6b",  # red
@@ -86,6 +91,9 @@ THEME = {
 }
 
 EDITED_BG = '#ff1744'   # scarlet highlight for session-modified bytes (both modes)
+ZOOM_MIN = 0.75
+ZOOM_MAX = 1.60
+ZOOM_STEP = 0.10
 
 
 def _contrast_fg(hex_color: str) -> str:
@@ -124,6 +132,8 @@ class BinaryFieldAnnotator:
         self.fields: list[dict] = []
         self._next_id = 0
         self._current_color = PALETTE[0]
+        self._custom_colors: list[str] = []
+        self._editing_field_id: int | None = None
 
         # Mouse selection state (annotation / drag-to-select)
         self._drag_anchor: int | None = None
@@ -139,6 +149,7 @@ class BinaryFieldAnnotator:
         self._edit_cursor: int | None = None
         self._edit_nibble: int = 0   # 0 = expecting high nibble, 1 = expecting low nibble
         self._edited: set[int] = set()  # offsets modified this session
+        self._ui_scale = 1.0
 
         # Resolve fonts (needs an existing root)
         self.mono_family = _resolve_font(
@@ -155,6 +166,20 @@ class BinaryFieldAnnotator:
         self.mono_font    = ctk.CTkFont(family=self.mono_family, size=12)
 
         self._paneds: list[tk.PanedWindow] = []
+        self._pane_minsizes: list[tuple[tk.PanedWindow, tk.Widget, int]] = []
+        self._console_visible = False
+        self._console_more = False
+        self._console_history: list[str] = []
+        self._console_history_index: int | None = None
+        self._console_output_cache = ""
+        self._console_floating = False
+        self._console_window: "ctk.CTkToplevel" | None = None
+        self._console_drag_origin: tuple[int, int] | None = None
+        self._console_dragging = False
+        self._console_dirty = False
+        self._console_changed_ranges: list[tuple[int, int]] = []
+        self._console = code.InteractiveConsole()
+        self._init_console_namespace()
 
         ttk.Style().theme_use('clam')   # required for Treeview color control
         self._build_ui()
@@ -185,6 +210,24 @@ class BinaryFieldAnnotator:
         ctk.CTkFrame(parent, width=1, height=26,
                      fg_color=self._tok('border')).pack(side=tk.LEFT, padx=10, pady=12)
 
+    def _scaled_int(self, value: int, minimum: int = 1) -> int:
+        return max(minimum, round(value * self._ui_scale))
+
+    def _font_size(self, value: int, minimum: int = 7) -> int:
+        return self._scaled_int(value, minimum)
+
+    def _make_paned(self, parent, orient):
+        paned = tk.PanedWindow(
+            parent, orient=orient, bd=0, sashwidth=self._scaled_int(6, 6),
+            sashrelief='flat', sashpad=0, handlesize=0, showhandle=False,
+            opaqueresize=False)
+        self._paneds.append(paned)
+        return paned
+
+    def _add_pane(self, paned, child, minsize: int, **kw):
+        paned.add(child, minsize=self._scaled_int(minsize), **kw)
+        self._pane_minsizes.append((paned, child, minsize))
+
     def _retheme_native(self, mode: str = 'dark'):
         """Apply the active palette to the non-CTk widgets (CTk ones auto-adapt)."""
         self._mode = mode
@@ -192,10 +235,17 @@ class BinaryFieldAnnotator:
 
         self.hex_text.configure(bg=t['hex_bg'], fg=t['text'],
                                 insertbackground=t['cursor_ins'],
-                                selectbackground=t['selection'])
+                                selectbackground=t['selection'],
+                                font=(self.mono_family, self._font_size(11)))
         self._detail_text.configure(bg=t['card'], fg=t['text'],
                                     insertbackground=t['cursor_ins'],
-                                    selectbackground=t['selection'])
+                                    selectbackground=t['selection'],
+                                    font=(self.mono_family, self._font_size(10)))
+        if hasattr(self, '_console_text'):
+            self._console_text.configure(bg=t['hex_bg'], fg=t['text'],
+                                         insertbackground=t['cursor_ins'],
+                                         selectbackground=t['selection'],
+                                         font=(self.mono_family, self._font_size(10)))
 
         # Edited highlight is constant; the edit cursor inverts per mode.
         self.hex_text.tag_configure('edited', background=EDITED_BG, foreground='#ffffff')
@@ -204,23 +254,31 @@ class BinaryFieldAnnotator:
         else:
             cur_bg, cur_fg = '#ffffff', '#000000'
         self.hex_text.tag_configure('edit_cursor', background=cur_bg, foreground=cur_fg,
-                                    font=(self.mono_family, 11, 'bold'))
+                                    font=(self.mono_family, self._font_size(11), 'bold'))
         self.hex_text.tag_configure('rangesel', background=t['selection'],
                                     foreground=t['text'])
 
         style = ttk.Style()
         style.configure('Treeview', background=t['card'], fieldbackground=t['card'],
-                        foreground=t['text'], rowheight=24, borderwidth=0,
-                        font=(self.ui_family, 10))
+                        foreground=t['text'], rowheight=self._scaled_int(24, 18),
+                        borderwidth=0, font=(self.ui_family, self._font_size(10)))
         style.configure('Treeview.Heading', background=t['surface'],
                         foreground=t['muted'], borderwidth=0,
-                        font=(self.ui_family, 10, 'bold'))
+                        font=(self.ui_family, self._font_size(10), 'bold'))
         style.map('Treeview',
                   background=[('selected', t['selection'])],
                   foreground=[('selected', t['text'])])
 
         for pw in self._paneds:
-            pw.configure(bg=t['border'])
+            pw.configure(bg=t['border'],
+                         sashwidth=self._scaled_int(6, 6),
+                         proxybackground=t['accent'],
+                         proxyborderwidth=1,
+                         proxyrelief='flat')
+
+        for paned, child, minsize in self._pane_minsizes:
+            if str(child) in paned.panes():
+                paned.paneconfigure(child, minsize=self._scaled_int(minsize))
 
     # ── UI construction ──────────────────────────────────────────────────────
 
@@ -231,13 +289,18 @@ class BinaryFieldAnnotator:
         body = ctk.CTkFrame(self.root, fg_color='transparent')
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=6)
 
-        paned = tk.PanedWindow(body, orient=tk.HORIZONTAL, bd=0,
-                               sashwidth=6, sashrelief='flat')
-        self._paneds.append(paned)
+        self._main_vpaned = self._make_paned(body, tk.VERTICAL)
+        self._main_vpaned.pack(fill=tk.BOTH, expand=True)
+
+        top = ctk.CTkFrame(self._main_vpaned, fg_color='transparent')
+        self._add_pane(self._main_vpaned, top, minsize=480, stretch='always')
+
+        paned = self._make_paned(top, tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
 
         self._build_hex_panel(paned)
         self._build_right_panel(paned)
+        self._build_python_console(self._main_vpaned)
 
         self._retheme_native('dark')
 
@@ -271,6 +334,9 @@ class BinaryFieldAnnotator:
             bar, text="Hex Edit", command=self._toggle_edit_mode,
             font=self.ui_font, progress_color=self._tok('danger'))
         self._edit_switch.pack(side=tk.LEFT, padx=10)
+        self._python_btn = self._btn(bar, "Python", self._toggle_python_console,
+                                     width=82, height=32)
+        self._python_btn.pack(side=tk.LEFT, padx=(2, 8), pady=11)
 
         # Right side: appearance toggle
         self._appearance = ctk.CTkSegmentedButton(
@@ -293,7 +359,7 @@ class BinaryFieldAnnotator:
 
     def _build_hex_panel(self, paned):
         frame = ctk.CTkFrame(paned, corner_radius=10, fg_color=self._tok('card'))
-        paned.add(frame, minsize=660)
+        self._add_pane(paned, frame, minsize=660)
 
         self._hover_label = ctk.CTkLabel(
             frame, text="  Hover over bytes to inspect", anchor='w',
@@ -305,7 +371,7 @@ class BinaryFieldAnnotator:
         hex_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
 
         self.hex_text = tk.Text(
-            hex_frame, font=(self.mono_family, 11),
+            hex_frame, font=(self.mono_family, self._font_size(11)),
             bd=0, relief='flat', highlightthickness=0,
             wrap=tk.NONE, state=tk.DISABLED, cursor='arrow')
         vsb = ctk.CTkScrollbar(hex_frame, command=self.hex_text.yview)
@@ -332,7 +398,7 @@ class BinaryFieldAnnotator:
         self.hex_text.tag_configure('rangesel', background='#2d4f78')
         self.hex_text.tag_configure('edit_cursor', background='#ffffff',
                                     foreground='#000000',
-                                    font=(self.mono_family, 11, 'bold'))
+                                    font=(self.mono_family, self._font_size(11), 'bold'))
 
     def _build_right_panel(self, paned):
         frame = ctk.CTkFrame(paned, corner_radius=10, fg_color=self._tok('surface'))
@@ -340,20 +406,85 @@ class BinaryFieldAnnotator:
 
         self._build_add_form(frame)
 
-        vpaned = tk.PanedWindow(frame, orient=tk.VERTICAL, bd=0,
-                                sashwidth=6, sashrelief='flat')
-        self._paneds.append(vpaned)
+        vpaned = self._make_paned(frame, tk.VERTICAL)
         vpaned.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
 
         fields_frame = ctk.CTkFrame(vpaned, corner_radius=10, fg_color=self._tok('card'))
-        vpaned.add(fields_frame, minsize=130, stretch='always')
+        self._add_pane(vpaned, fields_frame, minsize=130, stretch='always')
 
         detail_frame = ctk.CTkFrame(vpaned, corner_radius=10, fg_color=self._tok('card'))
-        vpaned.add(detail_frame, minsize=90, stretch='always')
+        self._add_pane(vpaned, detail_frame, minsize=90, stretch='always')
 
         self._build_fields_table(fields_frame)
         self._build_action_buttons(fields_frame)
         self._build_detail_pane(detail_frame)
+
+    def _build_python_console(self, paned):
+        self._console_dock_parent = paned
+        self._console_frame = self._create_python_console_frame(paned)
+        self._pane_minsizes.append((paned, self._console_frame, 180))
+
+    def _create_python_console_frame(self, parent):
+        frame = ctk.CTkFrame(parent, corner_radius=10, fg_color=self._tok('card'))
+
+        header = ctk.CTkFrame(frame, fg_color='transparent')
+        header.pack(fill=tk.X, padx=10, pady=(8, 4))
+        self._console_header = header
+        self._console_title = ctk.CTkLabel(
+            header, text="Python Console", font=self.ui_font_bold,
+            text_color=self._tok('accent'))
+        self._console_title.pack(side=tk.LEFT)
+        for widget in (header, self._console_title):
+            widget.bind('<ButtonPress-1>', self._console_drag_start)
+            widget.bind('<B1-Motion>', self._console_drag_motion)
+            widget.bind('<ButtonRelease-1>', self._console_drag_release)
+        self._btn(header, "Hide", self._hide_python_console,
+                  width=68, height=28, font=self.ui_font_sm).pack(side=tk.RIGHT, padx=(6, 0))
+        self._console_pop_btn = self._btn(
+            header, "Pop Out", self._float_python_console,
+            width=78, height=28, font=self.ui_font_sm)
+        self._console_pop_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        self._btn(header, "Clear", self._clear_console,
+                  width=68, height=28, font=self.ui_font_sm).pack(side=tk.RIGHT)
+
+        holder = ctk.CTkFrame(frame, fg_color='transparent')
+        holder.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
+
+        self._console_text = tk.Text(
+            holder, font=(self.mono_family, self._font_size(10)),
+            bd=0, relief='flat', highlightthickness=0,
+            state=tk.DISABLED, wrap=tk.WORD, height=8)
+        csb = ctk.CTkScrollbar(holder, command=self._console_text.yview)
+        self._console_text.configure(yscrollcommand=csb.set)
+        csb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._console_text.pack(fill=tk.BOTH, expand=True)
+
+        input_row = ctk.CTkFrame(frame, fg_color='transparent')
+        input_row.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self._console_prompt_var = tk.StringVar(value='...' if self._console_more else '>>>')
+        ctk.CTkLabel(input_row, textvariable=self._console_prompt_var,
+                     font=self.mono_font, width=32,
+                     text_color=self._tok('accent')).pack(side=tk.LEFT, padx=(2, 6))
+        self._console_input_var = tk.StringVar()
+        self._console_input = ctk.CTkEntry(
+            input_row, textvariable=self._console_input_var,
+            font=self.mono_font, height=30)
+        self._console_input.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._console_input.bind('<Return>', self._execute_console_line)
+        self._console_input.bind('<Up>', self._console_history_prev)
+        self._console_input.bind('<Down>', self._console_history_next)
+
+        if not self._console_output_cache:
+            self._console_output_cache = (
+                "Trusted local Python console. Imports and filesystem access are allowed.\n"
+                "Scripts run in the UI process; long-running code can block the app.\n"
+                "Use buf, app, refresh(), write(), insert(), delete(), hexdump(), len_buf().\n\n")
+        self._console_text.configure(state=tk.NORMAL)
+        self._console_text.insert('1.0', self._console_output_cache)
+        self._console_text.see(tk.END)
+        self._console_text.configure(state=tk.DISABLED)
+        self._retheme_native(self._mode)
+        return frame
 
     def _build_add_form(self, parent):
         card = ctk.CTkFrame(parent, corner_radius=10, fg_color=self._tok('card'))
@@ -384,12 +515,13 @@ class BinaryFieldAnnotator:
         ctk.CTkLabel(card, text="Color", font=self.ui_font_sm,
                      text_color=self._tok('muted')).grid(
                          row=5, column=0, sticky='w', padx=(12, 4), pady=(8, 3))
-        pal = ctk.CTkFrame(card, fg_color='transparent')
-        pal.grid(row=5, column=1, columnspan=3, sticky='w', pady=(8, 3))
+        self._palette_frame = ctk.CTkFrame(card, fg_color='transparent')
+        self._palette_frame.grid(row=5, column=1, columnspan=3, sticky='w', pady=(8, 3))
+        pal = self._palette_frame
 
         self._pal_btns: list = []
         for color in PALETTE:
-            b = ctk.CTkButton(pal, text='', width=22, height=22, corner_radius=6,
+            b = ctk.CTkButton(self._palette_frame, text='', width=22, height=22, corner_radius=6,
                               fg_color=color, hover_color=color,
                               border_width=0, command=lambda c=color: self._set_color(c))
             b.pack(side=tk.LEFT, padx=2)
@@ -417,7 +549,17 @@ class BinaryFieldAnnotator:
 
         self._btn(card, "Add Field   (Enter)", self.add_field, kind='accent',
                   font=self.ui_font_bold, height=34).grid(
-                      row=8, column=0, columnspan=4, sticky='ew', padx=12, pady=(8, 12))
+                      row=8, column=0, columnspan=4, sticky='ew', padx=12, pady=(8, 4))
+        edit_bar = ctk.CTkFrame(card, fg_color='transparent')
+        edit_bar.grid(row=9, column=0, columnspan=4, sticky='ew', padx=12, pady=(0, 12))
+        edit_bar.columnconfigure((0, 1), weight=1)
+        self._update_field_btn = self._btn(
+            edit_bar, "Update Selected", self.update_field, kind='accent',
+            font=self.ui_font_sm, height=30, state=tk.DISABLED)
+        self._update_field_btn.grid(row=0, column=0, sticky='ew', padx=(0, 4))
+        self._btn(edit_bar, "New Field", self._reset_field_form,
+                  font=self.ui_font_sm, height=30).grid(
+                      row=0, column=1, sticky='ew', padx=(4, 0))
 
     def _build_fields_table(self, parent):
         ctk.CTkLabel(parent, text="Defined Fields", font=self.ui_font_bold,
@@ -479,7 +621,7 @@ class BinaryFieldAnnotator:
         holder.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
 
         self._detail_text = tk.Text(
-            holder, font=(self.mono_family, 10),
+            holder, font=(self.mono_family, self._font_size(10)),
             bd=0, relief='flat', highlightthickness=0,
             state=tk.DISABLED, wrap=tk.NONE)
         dsb = ctk.CTkScrollbar(holder, command=self._detail_text.yview)
@@ -498,8 +640,343 @@ class BinaryFieldAnnotator:
         self.root.bind('<Control-s>', lambda _: self.save_annotations())
         self.root.bind('<Control-l>', lambda _: self.load_annotations())
         self.root.bind('<Control-S>', lambda _: self.save_binary())
-        self.root.bind('<Return>',    lambda _: self.add_field())
+        self.root.bind('<Return>',    lambda _: self._submit_field_form())
         self.root.bind('<Delete>',    lambda _: self.delete_field())
+        for seq in ('<Control-plus>', '<Control-equal>', '<Control-KP_Add>'):
+            self.root.bind(seq, self._zoom_in)
+        for seq in ('<Control-minus>', '<Control-underscore>', '<Control-KP_Subtract>'):
+            self.root.bind(seq, self._zoom_out)
+
+    # Scaling
+
+    def _set_ui_scale(self, scale: float) -> str:
+        scale = round(max(ZOOM_MIN, min(ZOOM_MAX, scale)), 2)
+        if scale == self._ui_scale:
+            return 'break'
+
+        self._ui_scale = scale
+        ctk.set_widget_scaling(scale)
+        self._retheme_native(self._mode)
+        if self.data is not None:
+            self._render()
+        else:
+            self._draw_selection()
+            self._draw_edit_cursor()
+        self._status_var.set(f"Scale: {int(round(scale * 100))}%")
+        return 'break'
+
+    def _zoom_in(self, _event=None) -> str:
+        return self._set_ui_scale(self._ui_scale + ZOOM_STEP)
+
+    def _zoom_out(self, _event=None) -> str:
+        return self._set_ui_scale(self._ui_scale - ZOOM_STEP)
+
+    # Embedded Python console
+
+    def _init_console_namespace(self):
+        ns = self._console.locals
+        ns.update({
+            'app': self,
+            'buf': self.data,
+            'refresh': self._console_refresh,
+            'write': self._console_write,
+            'insert': self._console_insert,
+            'delete': self._console_delete,
+            'hexdump': self._console_hexdump,
+            'len_buf': self._console_len_buf,
+        })
+
+    def _sync_console_buffer(self):
+        self._console.locals['buf'] = self.data
+
+    def _toggle_python_console(self):
+        if self._console_visible or self._console_floating:
+            self._hide_python_console()
+        else:
+            self._show_python_console()
+
+    def _show_python_console(self):
+        if self._console_floating:
+            self._console_input.focus_set()
+            return
+        if not self._console_visible:
+            self._main_vpaned.add(
+                self._console_frame, minsize=self._scaled_int(180, 120),
+                stretch='never')
+            self._console_visible = True
+            self._python_btn.configure(text="Python On")
+            self._console_pop_btn.configure(text="Pop Out",
+                                            command=self._float_python_console)
+        self._console_input.focus_set()
+
+    def _hide_python_console(self):
+        if self._console_visible:
+            self._main_vpaned.forget(self._console_frame)
+            self._console_visible = False
+        if self._console_floating:
+            self._dock_python_console(show=False)
+        self._python_btn.configure(text="Python")
+
+    def _float_python_console(self):
+        if self._console_floating:
+            return
+        if self._console_visible:
+            self._main_vpaned.forget(self._console_frame)
+            self._console_visible = False
+        self._console_frame.destroy()
+
+        self._console_window = ctk.CTkToplevel(self.root)
+        self._console_window.title("Python Console")
+        self._console_window.geometry("900x360")
+        self._console_window.minsize(520, 220)
+        self._console_window.protocol("WM_DELETE_WINDOW", self._hide_python_console)
+        self._console_frame = self._create_python_console_frame(self._console_window)
+        self._console_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self._console_floating = True
+        self._python_btn.configure(text="Python Out")
+        self._console_pop_btn.configure(text="Dock", command=self._dock_python_console)
+        self._console_input.focus_set()
+
+    def _dock_python_console(self, show: bool = True):
+        if self._console_floating:
+            self._console_frame.pack_forget()
+            if self._console_window is not None:
+                self._console_window.destroy()
+            self._console_window = None
+            self._console_floating = False
+            self._console_frame = self._create_python_console_frame(self._console_dock_parent)
+            self._pane_minsizes.append((self._console_dock_parent, self._console_frame, 180))
+        self._console_pop_btn.configure(text="Pop Out",
+                                        command=self._float_python_console)
+        if show:
+            self._show_python_console()
+
+    def _console_drag_start(self, event):
+        self._console_drag_origin = (event.x_root, event.y_root)
+        self._console_dragging = False
+        return 'break'
+
+    def _console_drag_motion(self, event):
+        if self._console_drag_origin is None:
+            return 'break'
+        ox, oy = self._console_drag_origin
+        dx = event.x_root - ox
+        dy = event.y_root - oy
+        if not self._console_dragging and abs(dx) + abs(dy) < 16:
+            return 'break'
+        self._console_dragging = True
+        if not self._console_floating:
+            self._float_python_console()
+        if self._console_window is not None:
+            width = max(self._console_window.winfo_width(), 520)
+            height = max(self._console_window.winfo_height(), 220)
+            self._console_window.geometry(
+                f"{width}x{height}+{event.x_root - 80}+{event.y_root - 18}")
+        return 'break'
+
+    def _console_drag_release(self, event):
+        if self._console_dragging and self._console_floating:
+            rx = self.root.winfo_rootx()
+            ry = self.root.winfo_rooty()
+            rw = self.root.winfo_width()
+            rh = self.root.winfo_height()
+            if rx <= event.x_root <= rx + rw and ry <= event.y_root <= ry + rh:
+                self._dock_python_console()
+        self._console_drag_origin = None
+        self._console_dragging = False
+        return 'break'
+
+    def _clear_console(self):
+        self._console_output_cache = ""
+        self._console_text.configure(state=tk.NORMAL)
+        self._console_text.delete('1.0', tk.END)
+        self._console_text.configure(state=tk.DISABLED)
+
+    def _append_console(self, text: str):
+        self._console_output_cache += text
+        self._console_text.configure(state=tk.NORMAL)
+        self._console_text.insert(tk.END, text)
+        self._console_text.see(tk.END)
+        self._console_text.configure(state=tk.DISABLED)
+
+    def _console_command_needs_snapshot(self, line: str) -> bool:
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith('#'):
+            return False
+        return 'buf' in line or 'app.' in line
+
+    def _mark_console_dirty(self, start: int = 0, end: int | None = None):
+        self._console_dirty = True
+        if self.data is None:
+            return
+        if end is None:
+            end = start
+        if self.data:
+            start = max(0, min(int(start), len(self.data) - 1))
+            end = max(start, min(int(end), len(self.data) - 1))
+            self._console_changed_ranges.append((start, end))
+
+    def _console_history_prev(self, _event=None):
+        if not self._console_history:
+            return 'break'
+        if self._console_history_index is None:
+            self._console_history_index = len(self._console_history) - 1
+        else:
+            self._console_history_index = max(0, self._console_history_index - 1)
+        self._console_input_var.set(self._console_history[self._console_history_index])
+        self._console_input.icursor(tk.END)
+        return 'break'
+
+    def _console_history_next(self, _event=None):
+        if self._console_history_index is None:
+            return 'break'
+        self._console_history_index += 1
+        if self._console_history_index >= len(self._console_history):
+            self._console_history_index = None
+            self._console_input_var.set('')
+        else:
+            self._console_input_var.set(self._console_history[self._console_history_index])
+        self._console_input.icursor(tk.END)
+        return 'break'
+
+    def _execute_console_line(self, _event=None):
+        line = self._console_input_var.get()
+        prompt = '...' if self._console_more else '>>>'
+        self._append_console(f"{prompt} {line}\n")
+        if line.strip():
+            self._console_history.append(line)
+        self._console_history_index = None
+        self._console_input_var.set('')
+
+        before = (
+            bytes(self.data)
+            if self.data is not None and self._console_command_needs_snapshot(line)
+            else None
+        )
+        before_len = len(before) if before is not None else (len(self.data) if self.data is not None else 0)
+        self._console_dirty = False
+        self._console_changed_ranges.clear()
+        self._sync_console_buffer()
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stdout):
+            self._console_more = self._console.push(line)
+        out = stdout.getvalue()
+        if out:
+            self._append_console(out)
+        self._console_prompt_var.set('...' if self._console_more else '>>>')
+        if not self._console_more:
+            self._sync_console_buffer()
+            self._after_console_command(before, before_len)
+        return 'break'
+
+    def _after_console_command(self, before: bytes | None, before_len: int = 0):
+        if self.data is None:
+            return
+        if before is None and not self._console_dirty and len(self.data) == before_len:
+            return
+        after_len = len(self.data)
+        if before is not None:
+            after = bytes(self.data)
+            if before == after:
+                return
+            first = 0
+            limit = min(len(before), len(after))
+            while first < limit and before[first] == after[first]:
+                first += 1
+            if len(before) == len(after):
+                changed = sum(1 for i in range(first, len(after)) if before[i] != after[i])
+            else:
+                changed = abs(len(after) - len(before))
+            for i in range(first, len(after)):
+                if i >= len(before) or before[i] != after[i]:
+                    self._edited.add(i)
+        elif self._console_changed_ranges:
+            first = min(start for start, _end in self._console_changed_ranges)
+            changed = sum(end - start + 1 for start, end in self._console_changed_ranges)
+            for start, end in self._console_changed_ranges:
+                self._edited.update(range(start, end + 1))
+        else:
+            first = 0
+            changed = abs(after_len - before_len)
+            self._edited.update(range(first, min(after_len, first + 4096)))
+        self._modified = True
+        self._update_title()
+        self._render()
+        self._refresh_inspector()
+        self._status_var.set(
+            f"Python console changed buffer: {changed} byte(s), size {after_len}")
+
+    def _require_console_buffer(self) -> bytearray:
+        if self.data is None:
+            raise RuntimeError("Open a binary file first; no buffer is loaded.")
+        return self.data
+
+    def _coerce_console_bytes(self, data) -> bytes:
+        if isinstance(data, int):
+            if not 0 <= data <= 255:
+                raise ValueError("Integer byte value must be between 0 and 255.")
+            return bytes([data])
+        if isinstance(data, str):
+            raise TypeError("Use bytes, bytearray, int, or an iterable of ints; strings are ambiguous.")
+        return bytes(data)
+
+    def _console_write(self, offset: int, data):
+        buf = self._require_console_buffer()
+        payload = self._coerce_console_bytes(data)
+        offset = int(offset)
+        if offset < 0 or offset + len(payload) > len(buf):
+            raise IndexError("write() range is outside the loaded buffer.")
+        buf[offset:offset + len(payload)] = payload
+        if payload:
+            self._mark_console_dirty(offset, offset + len(payload) - 1)
+        return len(payload)
+
+    def _console_insert(self, offset: int, data):
+        buf = self._require_console_buffer()
+        payload = self._coerce_console_bytes(data)
+        offset = int(offset)
+        if offset < 0 or offset > len(buf):
+            raise IndexError("insert() offset is outside the loaded buffer.")
+        buf[offset:offset] = payload
+        if payload:
+            self._mark_console_dirty(offset, offset + len(payload) - 1)
+        return len(payload)
+
+    def _console_delete(self, start: int, end: int | None = None):
+        buf = self._require_console_buffer()
+        start = int(start)
+        end = start if end is None else int(end)
+        if start > end:
+            start, end = end, start
+        if start < 0 or end >= len(buf):
+            raise IndexError("delete() range is outside the loaded buffer.")
+        count = end - start + 1
+        del buf[start:end + 1]
+        self._mark_console_dirty(start, min(start, len(buf) - 1))
+        return count
+
+    def _console_len_buf(self) -> int:
+        return len(self._require_console_buffer())
+
+    def _console_hexdump(self, start: int = 0, length: int = 256) -> str:
+        buf = self._require_console_buffer()
+        start = max(0, int(start))
+        length = max(0, int(length))
+        end = min(len(buf), start + length)
+        lines = []
+        for off in range(start, end, 16):
+            chunk = buf[off:off + 16]
+            h = ' '.join(f'{b:02X}' for b in chunk)
+            a = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+            lines.append(f"{off:08X}: {h:<48} |{a}|")
+        return '\n'.join(lines)
+
+    def _console_refresh(self):
+        self._sync_console_buffer()
+        if self.data is not None:
+            self._render()
+            self._refresh_inspector()
+        return len(self.data) if self.data is not None else 0
 
     # ── Appearance ─────────────────────────────────────────────────────────────
 
@@ -517,7 +994,20 @@ class BinaryFieldAnnotator:
     def _pick_custom_color(self):
         result = colorchooser.askcolor(color=self._current_color, title="Pick Field Color")
         if result[1]:
-            self._set_color(result[1])
+            color = result[1]
+            self._remember_custom_color(color)
+            self._set_color(color)
+
+    def _remember_custom_color(self, color: str):
+        color = color.lower()
+        if color in [c.lower() for c in PALETTE + self._custom_colors]:
+            return
+        self._custom_colors.append(color)
+        b = ctk.CTkButton(self._palette_frame, text='', width=22, height=22,
+                          corner_radius=6, fg_color=color, hover_color=color,
+                          border_width=0, command=lambda c=color: self._set_color(c))
+        b.pack(side=tk.LEFT, padx=2)
+        self._pal_btns.append(b)
 
     # ── File I/O ─────────────────────────────────────────────────────────────
 
@@ -533,6 +1023,7 @@ class BinaryFieldAnnotator:
         try:
             with open(path, 'rb') as f:
                 self.data = bytearray(f.read())
+            self._sync_console_buffer()
             self.filepath = path
             self._modified = False
             self._edited.clear()
@@ -560,7 +1051,11 @@ class BinaryFieldAnnotator:
         if not path:
             return
         with open(path, 'w') as f:
-            json.dump({'filepath': self.filepath, 'fields': self.fields}, f, indent=2)
+            json.dump({
+                'filepath': self.filepath,
+                'fields': self.fields,
+                'custom_colors': self._custom_colors,
+            }, f, indent=2)
         self._status_var.set(
             f"Saved {len(self.fields)} field(s) → {os.path.basename(path)}")
 
@@ -578,7 +1073,15 @@ class BinaryFieldAnnotator:
             return
 
         self.fields = saved.get('fields', [])
+        for color in saved.get('custom_colors', []):
+            self._remember_custom_color(color)
+        for fld in self.fields:
+            color = fld.get('color')
+            if color:
+                self._remember_custom_color(color)
         self._next_id = max((fld['id'] for fld in self.fields), default=-1) + 1
+        self._editing_field_id = None
+        self._update_field_btn.configure(state=tk.DISABLED)
         self._rebuild_tree()
         if self.data:
             self._render()
@@ -633,9 +1136,9 @@ class BinaryFieldAnnotator:
         lines = []
         for i in range(0, len(self.data), bpr):
             chunk = self.data[i:i + bpr]
-            h = ' '.join(f'{b:02X}' for b in chunk)
+            h = ''.join(f' {b:02X} ' for b in chunk)
             a = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
-            lines.append(f"{i:08X}  {h:<{bpr * 3 - 1}}  |{a}|")
+            lines.append(f"{i:08X}  {h:<{bpr * HEX_CELL_COLS}} |{a}|")
 
         self.hex_text.insert('1.0', '\n'.join(lines))
         self.hex_text.config(state=tk.DISABLED)
@@ -654,15 +1157,15 @@ class BinaryFieldAnnotator:
     def _tag_range(self, tag: str, start: int, end: int):
         """tag_add over the hex + ascii cells spanning byte offsets [start, end]."""
         bpr = self.bpr
-        ascii_base = OFFSET_COLS + (bpr * 3 - 1) + 3
+        ascii_base = OFFSET_COLS + bpr * HEX_CELL_COLS + 2
         for row in range(start // bpr, end // bpr + 1):
             row_base  = row * bpr
             col_start = max(start, row_base) - row_base
             col_end   = min(end,   row_base + bpr - 1) - row_base
             line      = row + 1
 
-            hc_s = OFFSET_COLS + col_start * 3
-            hc_e = OFFSET_COLS + col_end   * 3 + 2
+            hc_s = OFFSET_COLS + col_start * HEX_CELL_COLS
+            hc_e = OFFSET_COLS + (col_end + 1) * HEX_CELL_COLS
             ac_s = ascii_base + col_start
             ac_e = ascii_base + col_end + 1
 
@@ -689,12 +1192,12 @@ class BinaryFieldAnnotator:
         bpr  = self.bpr
         base = (line - 1) * bpr
 
-        hz_end   = OFFSET_COLS + bpr * 3 - 1
-        az_start = OFFSET_COLS + (bpr * 3 - 1) + 3
+        hz_end   = OFFSET_COLS + bpr * HEX_CELL_COLS
+        az_start = OFFSET_COLS + bpr * HEX_CELL_COLS + 2
         az_end   = az_start + bpr
 
         if OFFSET_COLS <= col < hz_end:
-            byte_col = (col - OFFSET_COLS) // 3
+            byte_col = (col - OFFSET_COLS) // HEX_CELL_COLS
         elif az_start <= col < az_end:
             byte_col = col - az_start
         else:
@@ -861,10 +1364,10 @@ class BinaryFieldAnnotator:
         bpr  = self.bpr
         row  = off // bpr + 1
         col  = off % bpr
-        ascii_base = OFFSET_COLS + (bpr * 3 - 1) + 3
+        ascii_base = OFFSET_COLS + bpr * HEX_CELL_COLS + 2
 
         # High nibble position is hc_start, low nibble is hc_start+1
-        hc_start = OFFSET_COLS + col * 3
+        hc_start = OFFSET_COLS + col * HEX_CELL_COLS + 1
         if self._edit_nibble == 0:
             hc_s, hc_e = hc_start, hc_start + 2      # whole byte
         else:
@@ -895,12 +1398,12 @@ class BinaryFieldAnnotator:
         bpr = self.bpr
         row = off // bpr + 1
         col = off % bpr
-        ascii_base = OFFSET_COLS + (bpr * 3 - 1) + 3
-        return row, OFFSET_COLS + col * 3, ascii_base + col
+        ascii_base = OFFSET_COLS + bpr * HEX_CELL_COLS + 2
+        return row, OFFSET_COLS + col * HEX_CELL_COLS + 1, ascii_base + col
 
     def _tag_byte(self, tag: str, off: int):
         row, hc_s, ac_s = self._byte_indices(off)
-        self.hex_text.tag_add(tag, f'{row}.{hc_s}', f'{row}.{hc_s + 2}')
+        self.hex_text.tag_add(tag, f'{row}.{hc_s - 1}', f'{row}.{hc_s + 3}')
         self.hex_text.tag_add(tag, f'{row}.{ac_s}', f'{row}.{ac_s + 1}')
 
     def _apply_edited_tags(self):
@@ -989,7 +1492,7 @@ class BinaryFieldAnnotator:
         menu = tk.Menu(self.root, tearoff=0, bd=0,
                        bg=t['card'], fg=t['text'],
                        activebackground=t['selection'], activeforeground=t['text'],
-                       font=(self.mono_family, 10))
+                       font=(self.mono_family, self._font_size(10)))
         menu.add_command(
             label=f"  Edit byte @ {hex(off)}  (0x{self.data[off]:02X} / {self.data[off]})",
             command=lambda: self._open_byte_editor(off))
@@ -1102,48 +1605,91 @@ class BinaryFieldAnnotator:
 
     # ── Field management ─────────────────────────────────────────────────────
 
-    def add_field(self):
+    def _parse_field_form(self) -> dict | None:
         if self.data is None:
             messagebox.showwarning("No File", "Open a binary file first.")
-            return
+            return None
         name = self._name_var.get().strip()
         if not name:
             messagebox.showwarning("Name Required", "Enter a field name.")
-            return
+            return None
         try:
             start = int(self._start_var.get(), 0)
             end   = int(self._end_var.get(),   0)
         except ValueError:
             messagebox.showerror("Invalid Offset",
                                   "Start/End must be integers (e.g. 42 or 0x2a).")
-            return
+            return None
         if start > end:
             start, end = end, start
+        if start < 0:
+            messagebox.showwarning("Out of Range", "Start must be 0 or greater.")
+            return None
         if end >= len(self.data):
             messagebox.showwarning("Out of Range",
                                     f"End {hex(end)} exceeds file size "
                                     f"{hex(len(self.data) - 1)}.")
-            return
-
-        fld = {
-            'id':    self._next_id,
+            return None
+        return {
             'name':  name,
             'start': start,
             'end':   end,
             'color': self._current_color,
             'note':  self._note_var.get().strip(),
         }
+
+    def _submit_field_form(self):
+        if self._editing_field_id is not None:
+            return self.update_field()
+        self.add_field()
+        return 'break'
+
+    def _field_by_id(self, fid: int) -> dict | None:
+        return next((f for f in self.fields if f['id'] == fid), None)
+
+    def _reset_field_form(self):
+        self._editing_field_id = None
+        self._update_field_btn.configure(state=tk.DISABLED)
+        self._name_var.set('')
+        self._start_var.set('0x0')
+        self._end_var.set('0x0')
+        self._note_var.set('')
+        sel = self.tree.selection()
+        if sel:
+            self.tree.selection_remove(*sel)
+        if not self._edit_mode:
+            self._click_hint.configure(
+                text="Drag in hex view to select a field range  Â·  Shift+Click to extend",
+                text_color='#ffd93d')
+        return 'break'
+
+    def _update_tree_item(self, fld: dict):
+        length = fld['end'] - fld['start'] + 1
+        color = fld['color']
+        values = (fld['name'], hex(fld['start']), hex(fld['end']),
+                  length, fld.get('note', ''))
+        iid = str(fld['id'])
+        if self.tree.exists(iid):
+            self.tree.item(iid, values=values, tags=(color,))
+        else:
+            self.tree.insert('', tk.END, iid=iid, values=values, tags=(color,))
+        self.tree.tag_configure(color, background=color,
+                                foreground=_contrast_fg(color))
+
+    def _clear_field_tag(self, fid: int):
+        tag = f"f:{fid}"
+        if tag in self.hex_text.tag_names():
+            self.hex_text.tag_delete(tag)
+
+    def add_field(self):
+        parsed = self._parse_field_form()
+        if parsed is None:
+            return
+
+        fld = {'id': self._next_id, **parsed}
         self._next_id += 1
         self.fields.append(fld)
-
-        length = end - start + 1
-        color  = fld['color']
-        self.tree.insert('', tk.END, iid=str(fld['id']),
-                          values=(name, hex(start), hex(end), length, fld['note']),
-                          tags=(color,))
-        self.tree.tag_configure(color,
-                                 background=color,
-                                 foreground=_contrast_fg(color))
+        self._update_tree_item(fld)
 
         if self.data is not None:
             self.hex_text.config(state=tk.NORMAL)
@@ -1156,8 +1702,7 @@ class BinaryFieldAnnotator:
         except ValueError:
             pass
 
-        self._name_var.set('')
-        self._note_var.set('')
+        self._reset_field_form()
         self._clear_selection()
         # Show the freshly created field in the inspector as confirmation.
         self._inspect_mode = 'field'
@@ -1167,6 +1712,41 @@ class BinaryFieldAnnotator:
             self._click_hint.configure(
                 text="Drag in hex view to select a field range  ·  Shift+Click to extend",
                 text_color='#ffd93d')
+
+    def update_field(self):
+        if self._editing_field_id is None:
+            sel = self.tree.selection()
+            if not sel:
+                return 'break'
+            self._editing_field_id = int(sel[0])
+        fld = self._field_by_id(self._editing_field_id)
+        if fld is None:
+            self._editing_field_id = None
+            self._update_field_btn.configure(state=tk.DISABLED)
+            return 'break'
+
+        parsed = self._parse_field_form()
+        if parsed is None:
+            return 'break'
+
+        fid = fld['id']
+        fld.update(parsed)
+        self._update_tree_item(fld)
+        if self.data is not None:
+            self.hex_text.config(state=tk.NORMAL)
+            self._clear_field_tag(fid)
+            self._apply_tag(fld)
+            self.hex_text.config(state=tk.DISABLED)
+            self._apply_edited_tags()
+            self._draw_selection()
+            self._draw_edit_cursor()
+
+        self.tree.selection_set(str(fid))
+        self._inspect_mode = 'field'
+        self._inspect_field_id = fid
+        self._refresh_inspector()
+        self._status_var.set(f"Updated field: {fld['name']}")
+        return 'break'
 
     def delete_field(self):
         sel = self.tree.selection()
@@ -1180,6 +1760,9 @@ class BinaryFieldAnnotator:
             self.hex_text.tag_delete(tag)
         if self._inspect_mode == 'field' and self._inspect_field_id == fid:
             self._inspect_mode = None
+        if self._editing_field_id == fid:
+            self._editing_field_id = None
+            self._update_field_btn.configure(state=tk.DISABLED)
         self._clear_detail()
 
     def clear_all(self):
@@ -1195,6 +1778,8 @@ class BinaryFieldAnnotator:
         for item in self.tree.get_children():
             self.tree.delete(item)
         self._clear_selection()
+        self._editing_field_id = None
+        self._update_field_btn.configure(state=tk.DISABLED)
         self._inspect_mode = None
         self._clear_detail()
 
@@ -1214,8 +1799,22 @@ class BinaryFieldAnnotator:
         sel = self.tree.selection()
         if not sel:
             return
+        fid = int(sel[0])
+        fld = self._field_by_id(fid)
+        if fld is None:
+            return
+        self._editing_field_id = fid
+        self._name_var.set(fld['name'])
+        self._start_var.set(hex(fld['start']))
+        self._end_var.set(hex(fld['end']))
+        self._note_var.set(fld.get('note', ''))
+        self._set_color(fld['color'])
+        self._update_field_btn.configure(state=tk.NORMAL)
+        self._click_hint.configure(
+            text="Editing selected field. Change values, then Update Selected.",
+            text_color='#6bcb77')
         self._inspect_mode = 'field'
-        self._inspect_field_id = int(sel[0])
+        self._inspect_field_id = fid
         self._refresh_inspector()
 
     _INSPECT_FORMATS = ['Integer', 'Float', 'String', 'Hex', 'Binary', 'Bytes (dec)']
@@ -1348,14 +1947,7 @@ class BinaryFieldAnnotator:
         for item in self.tree.get_children():
             self.tree.delete(item)
         for fld in self.fields:
-            length = fld['end'] - fld['start'] + 1
-            color  = fld['color']
-            self.tree.insert('', tk.END, iid=str(fld['id']),
-                              values=(fld['name'], hex(fld['start']),
-                                      hex(fld['end']), length, fld.get('note', '')),
-                              tags=(color,))
-            self.tree.tag_configure(color, background=color,
-                                     foreground=_contrast_fg(color))
+            self._update_tree_item(fld)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
